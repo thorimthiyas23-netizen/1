@@ -254,13 +254,28 @@ async def download_and_send_clean_file(
 
 
 async def save_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     try:
         if collection is None:
             return
 
         msg = update.effective_message
         if not msg or not (msg.video or msg.document):
+            return
+
+        chat = update.effective_chat
+        user = update.effective_user
+        is_private_owner_upload = (
+            chat is not None
+            and chat.type == "private"
+            and user is not None
+            and OWNER_ID
+            and user.id == OWNER_ID
+        )
+
+        if chat is None:
+            return
+
+        if chat.type == "private" and not is_private_owner_upload:
             return
 
         raw = msg.caption or (msg.document.file_name if msg.document else "movie")
@@ -290,6 +305,9 @@ async def save_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 }
             )
         logger.info("Saved movie: %s", display_name)
+
+        if is_private_owner_upload:
+            await msg.reply_text(f"✅ Saved: {display_name}")
     except Exception:
         logger.exception("Save error")
 
@@ -435,7 +453,7 @@ async def run_bot() -> None:
     telegram_app: Application = ApplicationBuilder().token(BOT_TOKEN).updater(None).build()
     telegram_app.add_handler(
         MessageHandler(
-            (filters.ChatType.CHANNEL | filters.ChatType.GROUPS)
+            ((filters.ChatType.CHANNEL | filters.ChatType.GROUPS | filters.ChatType.PRIVATE))
             & (filters.VIDEO | filters.Document.ALL),
             save_movie,
         )
