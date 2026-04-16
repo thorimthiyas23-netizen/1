@@ -9,6 +9,7 @@ from pymongo import MongoClient
 from pymongo.collection import Collection
 from rapidfuzz import fuzz
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -33,6 +34,10 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 PORT = int(os.getenv("PORT", "8080"))
 DELETE_AFTER_SECONDS = int(os.getenv("DELETE_AFTER_SECONDS", "300"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
+RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram").strip() or "/telegram"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 
 collection: Optional[Collection] = None
@@ -108,6 +113,14 @@ def score_movie(query: str, movie_name: str) -> float:
     token = fuzz.token_set_ratio(query, movie_name)
     ratio = fuzz.ratio(query, movie_name)
     return max(partial, token, ratio)
+
+
+def get_public_base_url() -> str:
+    if WEBHOOK_URL:
+        return WEBHOOK_URL
+    if RAILWAY_PUBLIC_DOMAIN:
+        return f"https://{RAILWAY_PUBLIC_DOMAIN}".rstrip("/")
+    return ""
 
 
 async def save_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -219,16 +232,32 @@ async def healthcheck(_request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
-async def start_health_server() -> web.AppRunner:
+async def telegram_webhook(request: web.Request) -> web.Response:
+    telegram_app: Application = request.app["telegram_app"]
+
+    if WEBHOOK_SECRET:
+        secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if secret != WEBHOOK_SECRET:
+            return web.Response(status=403, text="forbidden")
+
+    data = await request.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return web.Response(status=200, text="ok")
+
+
+async def start_http_server(telegram_app: Application) -> web.AppRunner:
     app = web.Application()
+    app["telegram_app"] = telegram_app
     app.router.add_get("/", healthcheck)
     app.router.add_get("/health", healthcheck)
+    app.router.add_post(WEBHOOK_PATH, telegram_webhook)
 
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
     await site.start()
-    logger.info("Health server listening on port %s", PORT)
+    logger.info("HTTP server listening on port %s", PORT)
     return runner
 
 
@@ -236,12 +265,14 @@ def validate_env() -> None:
     missing = [name for name, value in {"BOT_TOKEN": BOT_TOKEN, "BOT_USERNAME": BOT_USERNAME}.items() if not value]
     if missing:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+    if not get_public_base_url():
+        raise RuntimeError("Missing webhook public URL. Set WEBHOOK_URL or Railway public domain.")
 
 
 async def run_bot() -> None:
     validate_env()
 
-    telegram_app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+    telegram_app: Application = ApplicationBuilder().token(BOT_TOKEN).updater(None).build()
     telegram_app.add_handler(
         MessageHandler(
             (filters.ChatType.CHANNEL | filters.ChatType.GROUPS)
@@ -254,13 +285,23 @@ async def run_bot() -> None:
 
     await telegram_app.initialize()
     await telegram_app.start()
-    await telegram_app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Telegram bot started")
+    webhook_target = f"{get_public_base_url()}{WEBHOOK_PATH}"
+    await telegram_app.bot.delete_webhook(drop_pending_updates=True)
+    await telegram_app.bot.set_webhook(
+        url=webhook_target,
+        secret_token=WEBHOOK_SECRET or None,
+    )
+    logger.info("Telegram webhook set to %s", webhook_target)
+    http_runner = await start_http_server(telegram_app)
 
     try:
         await asyncio.Event().wait()
     finally:
-        await telegram_app.updater.stop()
+        try:
+            await telegram_app.bot.delete_webhook()
+        except TelegramError:
+            logger.exception("Failed to delete webhook during shutdown")
+        await http_runner.cleanup()
         await telegram_app.stop()
         await telegram_app.shutdown()
 
@@ -269,12 +310,7 @@ async def main() -> None:
     global collection
     collection = get_collection()
     load_movie_cache()
-    health_runner = await start_health_server()
-
-    try:
-        await run_bot()
-    finally:
-        await health_runner.cleanup()
+    await run_bot()
 
 
 if __name__ == "__main__":
