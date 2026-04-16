@@ -74,24 +74,28 @@ def load_movie_cache() -> None:
         movie_cache = []
         return
 
-    movie_cache = list(collection.find({}, {"name": 1, "msg_id": 1, "_id": 0}))
+    movie_cache = list(collection.find({}, {"name": 1, "display_name": 1, "msg_id": 1, "_id": 0}))
     logger.info("Loaded %s movies into memory cache", len(movie_cache))
 
 
-def clean_name(raw: str) -> str:
+def build_display_name(raw: str) -> str:
     text = raw.lower()
     text = re.sub(r"https?://\S+", " ", text)
     text = re.sub(r"(?:t\.me|telegram\.me|telegram\.dog)/\S+", " ", text)
     text = re.sub(r"(?:joinchat/|\+)\S+", " ", text)
     text = re.sub(r"@\w+", " ", text)
     text = re.sub(r"\b[a-z][a-z0-9_]{4,}(?:bot)?\b", " ", text)
-    text = re.sub(r"\.(mkv|mp4|avi)$", "", text)
+    format_match = re.search(r"\.(mkv|mp4|avi)\b", text)
+    movie_format = format_match.group(1).upper() if format_match else ""
+    quality_match = re.search(r"\b(2160p|1080p|720p|480p)\b", text)
+    quality = quality_match.group(1) if quality_match else ""
+    text = re.sub(r"\.(mkv|mp4|avi)\b", " ", text)
     text = re.sub(r"[._]+", " ", text)
     text = re.sub(
         r"\b("
-        r"1080p|720p|480p|hdrip|bluray|x264|x265|webrip|web-dl|"
+        r"2160p|1080p|720p|480p|hdrip|bluray|x264|x265|webrip|web-dl|"
         r"tamil|dubbed|join|channel|group|movie\s*request|request|"
-        r"admin|owner|official|telegram"
+        r"admin|owner|official|telegram|filename"
         r")\b",
         "",
         text,
@@ -103,7 +107,7 @@ def clean_name(raw: str) -> str:
     year = year_match.group(1) if year_match else ""
 
     size_match = re.search(r"\b(\d+(?:\.\d+)?\s?(?:gb|mb))\b", text)
-    size = size_match.group(1) if size_match else ""
+    size = size_match.group(1).upper().replace(" ", "") if size_match else ""
 
     name = " ".join(text.split())
     if name.startswith("thm "):
@@ -111,19 +115,27 @@ def clean_name(raw: str) -> str:
     elif name == "thm":
         name = ""
 
-    final = f"THM {name.title()}".strip()
+    final = name.title().strip()
     if year:
         final += f" ({year})"
+    if quality:
+        final += f" {quality}"
     if size:
-        final += f" [{size.upper()}]"
+        final += f" [{size}]"
+    if movie_format:
+        final += f" {movie_format}"
     return final
+
+
+def clean_name(raw: str) -> str:
+    return build_display_name(raw)
 
 
 def display_caption(movie: Optional[dict[str, str | int]]) -> str:
     if not movie:
         return "Movie File"
 
-    title = str(movie["name"]).title()
+    title = str(movie.get("display_name") or movie["name"])
     title = re.sub(r"\s+", " ", title).strip()
     return title or "Movie File"
 
@@ -194,16 +206,17 @@ async def save_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
 
         raw = msg.caption or (msg.document.file_name if msg.document else "movie")
-        name = clean_name(raw)
+        display_name = build_display_name(raw)
+        name = display_name.lower()
 
         collection.update_one(
             {"msg_id": msg.message_id},
-            {"$setOnInsert": {"name": name.lower(), "msg_id": msg.message_id}},
+            {"$setOnInsert": {"name": name, "display_name": display_name, "msg_id": msg.message_id}},
             upsert=True,
         )
         if not any(int(item["msg_id"]) == msg.message_id for item in movie_cache):
-            movie_cache.append({"name": name.lower(), "msg_id": msg.message_id})
-        logger.info("Saved movie: %s", name)
+            movie_cache.append({"name": name, "display_name": display_name, "msg_id": msg.message_id})
+        logger.info("Saved movie: %s", display_name)
     except Exception:
         logger.exception("Save error")
 
