@@ -42,6 +42,7 @@ WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram").strip() or "/telegram"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 JOIN_CHANNEL_URL = "https://t.me/tamilmoviesandhollywooddubbed"
 FILE_PREFIX = "THM Uploaded By IMTHI"
+BOT_UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024
 
 
 collection: Optional[Collection] = None
@@ -221,6 +222,27 @@ async def download_and_send_clean_file(
         await context.bot.delete_message(target_chat_id, forwarded.message_id)
         raise RuntimeError("Source message does not contain a downloadable document/video")
 
+    clean_caption = display_caption(movie)
+
+    if getattr(media, "file_size", 0) and int(media.file_size) > BOT_UPLOAD_LIMIT_BYTES:
+        try:
+            await context.bot.delete_message(target_chat_id, forwarded.message_id)
+        except Exception:
+            logger.warning("Could not delete temporary forwarded message %s", forwarded.message_id)
+
+        if forwarded.document:
+            return await context.bot.send_document(
+                chat_id=target_chat_id,
+                document=forwarded.document.file_id,
+                caption=clean_caption,
+            )
+
+        return await context.bot.send_video(
+            chat_id=target_chat_id,
+            video=forwarded.video.file_id,
+            caption=clean_caption,
+        )
+
     telegram_file = await media.get_file()
     file_name = build_file_name(movie)
     suffix = Path(file_name).suffix or ".bin"
@@ -241,7 +263,7 @@ async def download_and_send_clean_file(
             clean_message = await context.bot.send_document(
                 chat_id=target_chat_id,
                 document=InputFile(file_handle, filename=file_name),
-                caption=display_caption(movie),
+                caption=clean_caption,
             )
 
         return clean_message
