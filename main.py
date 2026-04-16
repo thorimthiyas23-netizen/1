@@ -84,6 +84,7 @@ def clean_name(raw: str) -> str:
     text = re.sub(r"(?:t\.me|telegram\.me|telegram\.dog)/\S+", " ", text)
     text = re.sub(r"(?:joinchat/|\+)\S+", " ", text)
     text = re.sub(r"@\w+", " ", text)
+    text = re.sub(r"\b[a-z][a-z0-9_]{4,}(?:bot)?\b", " ", text)
     text = re.sub(r"\.(mkv|mp4|avi)$", "", text)
     text = re.sub(r"[._]+", " ", text)
     text = re.sub(
@@ -283,6 +284,16 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             caption=clean_caption,
             reply_markup=None,
         )
+
+        try:
+            await context.bot.edit_message_caption(
+                chat_id=update.effective_chat.id,
+                message_id=sent.message_id,
+                caption=clean_caption,
+                reply_markup=None,
+            )
+        except Exception:
+            logger.warning("Could not force-clean caption for message %s", sent.message_id)
 
         warn = await update.message.reply_text(
             "⚠️ This file will be deleted after 5 minutes.\nForward it to Saved Messages."
