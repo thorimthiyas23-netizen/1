@@ -39,6 +39,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
 RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram").strip() or "/telegram"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+JOIN_CHANNEL_URL = "https://t.me/tamilmoviesandhollywooddubbed"
 
 
 collection: Optional[Collection] = None
@@ -180,9 +181,22 @@ async def save_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         logger.exception("Save error")
 
 
+async def send_join_channel_message(update: Update) -> None:
+    if update.message:
+        await update.message.reply_text(
+            "🔒 Files are not shared in private chat.\n"
+            "📢 Kindly join our channel first:\n"
+            f"{JOIN_CHANNEL_URL}"
+        )
+
+
 async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
     try:
+        if update.effective_chat and update.effective_chat.type == "private":
+            await send_join_channel_message(update)
+            return
+
         if collection is None:
             await update.message.reply_text("⚠️ Database not connected.")
             return
@@ -224,6 +238,10 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
+        if update.effective_chat and update.effective_chat.type == "private":
+            await send_join_channel_message(update)
+            return
+
         if not context.args:
             await update.message.reply_text("🎬 Send a movie name to search.")
             return
