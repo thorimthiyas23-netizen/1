@@ -205,6 +205,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.delete_message(update.effective_chat.id, message_id)
             except Exception:
                 logger.warning("Could not delete message %s", message_id)
+
+        await update.effective_chat.send_message(
+            "🗑️ File deleted after 5 minutes.\n🔒 Request it again if you still need it."
+        )
     except Exception:
         logger.exception("Start command error")
         if update.message:
