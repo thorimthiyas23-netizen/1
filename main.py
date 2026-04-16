@@ -2,14 +2,16 @@ import asyncio
 import logging
 import os
 import re
+import tempfile
 import time
+from pathlib import Path
 from typing import Optional
 
 from aiohttp import web
 from pymongo import MongoClient
 from pymongo.collection import Collection
 from rapidfuzz import fuzz
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -31,7 +33,6 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MONGO_URI = os.getenv("MONGO_URI", "").strip()
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 PORT = int(os.getenv("PORT", "8080"))
 DELETE_AFTER_SECONDS = int(os.getenv("DELETE_AFTER_SECONDS", "300"))
@@ -40,6 +41,7 @@ RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram").strip() or "/telegram"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 JOIN_CHANNEL_URL = "https://t.me/tamilmoviesandhollywooddubbed"
+FILE_PREFIX = "THM Uploaded By IMTHI"
 
 
 collection: Optional[Collection] = None
@@ -74,38 +76,43 @@ def load_movie_cache() -> None:
         movie_cache = []
         return
 
-    movie_cache = list(collection.find({}, {"name": 1, "display_name": 1, "msg_id": 1, "_id": 0}))
+    movie_cache = list(
+        collection.find({}, {"name": 1, "display_name": 1, "file_ext": 1, "msg_id": 1, "_id": 0})
+    )
     logger.info("Loaded %s movies into memory cache", len(movie_cache))
 
 
-def build_display_name(raw: str) -> str:
+def extract_metadata(raw: str) -> tuple[str, str]:
     text = raw.lower()
     text = re.sub(r"https?://\S+", " ", text)
     text = re.sub(r"(?:t\.me|telegram\.me|telegram\.dog)/\S+", " ", text)
     text = re.sub(r"(?:joinchat/|\+)\S+", " ", text)
     text = re.sub(r"@\w+", " ", text)
     text = re.sub(r"\b[a-z][a-z0-9_]{4,}(?:bot)?\b", " ", text)
+
     format_match = re.search(r"\.(mkv|mp4|avi)\b", text)
-    movie_format = format_match.group(1).upper() if format_match else ""
+    movie_format = format_match.group(1).lower() if format_match else "mkv"
     quality_match = re.search(r"\b(2160p|1080p|720p|480p)\b", text)
     quality = quality_match.group(1) if quality_match else ""
+
     text = re.sub(r"\.(mkv|mp4|avi)\b", " ", text)
     text = re.sub(r"[._]+", " ", text)
     text = re.sub(
         r"\b("
         r"2160p|1080p|720p|480p|hdrip|bluray|x264|x265|webrip|web-dl|"
         r"tamil|dubbed|join|channel|group|movie\s*request|request|"
-        r"admin|owner|official|telegram|filename"
+        r"admin|owner|official|telegram|filename|upload(?:ed)?|by|repack|"
+        r"10bit|6ch|hevc|aac|ddp|hq|hqcam|camrip|proper|extended|uncut|"
+        r"pahe|mkvcinemas|yts|rarbg"
         r")\b",
-        "",
+        " ",
         text,
     )
-    text = re.sub(r"[\[\](){}|]", " ", text)
+    text = re.sub(r"[\[\](){}|:]", " ", text)
     text = re.sub(r"\b\d{5,}\b", " ", text)
 
     year_match = re.search(r"\b((?:19|20)\d{2})\b", text)
     year = year_match.group(1) if year_match else ""
-
     size_match = re.search(r"\b(\d+(?:\.\d+)?\s?(?:gb|mb))\b", text)
     size = size_match.group(1).upper().replace(" ", "") if size_match else ""
 
@@ -115,29 +122,31 @@ def build_display_name(raw: str) -> str:
     elif name == "thm":
         name = ""
 
-    final = name.title().strip()
+    display_name = name.title().strip() or "Movie File"
     if year:
-        final += f" ({year})"
+        display_name += f" ({year})"
     if quality:
-        final += f" {quality}"
+        display_name += f" {quality}"
     if size:
-        final += f" [{size}]"
-    if movie_format:
-        final += f" {movie_format}"
-    return final
-
-
-def clean_name(raw: str) -> str:
-    return build_display_name(raw)
+        display_name += f" [{size}]"
+    display_name += f" {movie_format.upper()}"
+    display_name = re.sub(r"\s+", " ", display_name).strip()
+    return display_name, movie_format
 
 
 def display_caption(movie: Optional[dict[str, str | int]]) -> str:
     if not movie:
         return "Movie File"
-
     title = str(movie.get("display_name") or movie["name"])
-    title = re.sub(r"\s+", " ", title).strip()
-    return title or "Movie File"
+    return re.sub(r"\s+", " ", title).strip() or "Movie File"
+
+
+def build_file_name(movie: Optional[dict[str, str | int]]) -> str:
+    caption = display_caption(movie)
+    ext = str(movie.get("file_ext") or "mkv").lower() if movie else "mkv"
+    safe_title = re.sub(r'[\\/:*?"<>|]+', "", caption)
+    safe_title = re.sub(r"\s+", " ", safe_title).strip()
+    return f"{FILE_PREFIX} - {safe_title}.{ext}"
 
 
 def score_movie(query: str, movie_name: str) -> float:
@@ -195,6 +204,55 @@ async def delete_temporary_messages(
         logger.warning("Could not send delete confirmation to chat %s", chat_id)
 
 
+async def download_and_send_clean_file(
+    context: ContextTypes.DEFAULT_TYPE,
+    target_chat_id: int,
+    msg_id: int,
+    movie: Optional[dict[str, str | int]],
+):
+    forwarded = await context.bot.forward_message(
+        chat_id=target_chat_id,
+        from_chat_id=CHANNEL_ID,
+        message_id=msg_id,
+    )
+
+    media = forwarded.document or forwarded.video
+    if media is None:
+        await context.bot.delete_message(target_chat_id, forwarded.message_id)
+        raise RuntimeError("Source message does not contain a downloadable document/video")
+
+    telegram_file = await media.get_file()
+    file_name = build_file_name(movie)
+    suffix = Path(file_name).suffix or ".bin"
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_path = temp_file.name
+
+        await telegram_file.download_to_drive(custom_path=temp_path)
+
+        try:
+            await context.bot.delete_message(target_chat_id, forwarded.message_id)
+        except Exception:
+            logger.warning("Could not delete temporary forwarded message %s", forwarded.message_id)
+
+        with open(temp_path, "rb") as file_handle:
+            clean_message = await context.bot.send_document(
+                chat_id=target_chat_id,
+                document=InputFile(file_handle, filename=file_name),
+                caption=display_caption(movie),
+            )
+
+        return clean_message
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                logger.warning("Could not remove temp file %s", temp_path)
+
+
 async def save_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
     try:
@@ -206,16 +264,31 @@ async def save_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
 
         raw = msg.caption or (msg.document.file_name if msg.document else "movie")
-        display_name = build_display_name(raw)
-        name = display_name.lower()
+        display_name, file_ext = extract_metadata(raw)
+        search_name = display_name.lower()
 
         collection.update_one(
             {"msg_id": msg.message_id},
-            {"$setOnInsert": {"name": name, "display_name": display_name, "msg_id": msg.message_id}},
+            {
+                "$setOnInsert": {
+                    "name": search_name,
+                    "display_name": display_name,
+                    "file_ext": file_ext,
+                    "msg_id": msg.message_id,
+                }
+            },
             upsert=True,
         )
+
         if not any(int(item["msg_id"]) == msg.message_id for item in movie_cache):
-            movie_cache.append({"name": name, "display_name": display_name, "msg_id": msg.message_id})
+            movie_cache.append(
+                {
+                    "name": search_name,
+                    "display_name": display_name,
+                    "file_ext": file_ext,
+                    "msg_id": msg.message_id,
+                }
+            )
         logger.info("Saved movie: %s", display_name)
     except Exception:
         logger.exception("Save error")
@@ -259,17 +332,13 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         results = sorted(results, key=lambda item: item[0], reverse=True)[:6]
-
         text = f"🔎 Query: {query}\n🎬 Results: {len(results)}\n\nTap below 👇"
         buttons = []
         for _, movie in results:
             url = f"https://t.me/{BOT_USERNAME}?start={movie['msg_id']}"
-            buttons.append([InlineKeyboardButton(str(movie["name"]).title(), url=url)])
+            buttons.append([InlineKeyboardButton(display_caption(movie), url=url)])
 
-        await update.message.reply_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
     except Exception:
         logger.exception("Search error")
         if update.message:
@@ -288,25 +357,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         msg_id = int(context.args[0])
         movie = get_cached_movie(msg_id)
-        clean_caption = display_caption(movie)
-
-        sent = await context.bot.copy_message(
-            chat_id=update.effective_chat.id,
-            from_chat_id=CHANNEL_ID,
-            message_id=msg_id,
-            caption=clean_caption,
-            reply_markup=None,
+        sent = await download_and_send_clean_file(
+            context,
+            target_chat_id=update.effective_chat.id,
+            msg_id=msg_id,
+            movie=movie,
         )
-
-        try:
-            await context.bot.edit_message_caption(
-                chat_id=update.effective_chat.id,
-                message_id=sent.message_id,
-                caption=clean_caption,
-                reply_markup=None,
-            )
-        except Exception:
-            logger.warning("Could not force-clean caption for message %s", sent.message_id)
 
         warn = await update.message.reply_text(
             "⚠️ This file will be deleted after 5 minutes.\nForward it to Saved Messages."
