@@ -36,6 +36,7 @@ DELETE_AFTER_SECONDS = int(os.getenv("DELETE_AFTER_SECONDS", "300"))
 
 
 collection: Optional[Collection] = None
+movie_cache: list[dict[str, str | int]] = []
 
 
 def get_collection() -> Optional[Collection]:
@@ -56,6 +57,17 @@ def get_collection() -> Optional[Collection]:
     except Exception:
         logger.exception("MongoDB connection failed")
         return None
+
+
+def load_movie_cache() -> None:
+    global movie_cache
+
+    if collection is None:
+        movie_cache = []
+        return
+
+    movie_cache = list(collection.find({}, {"name": 1, "msg_id": 1, "_id": 0}))
+    logger.info("Loaded %s movies into memory cache", len(movie_cache))
 
 
 def clean_name(raw: str) -> str:
@@ -88,6 +100,16 @@ def clean_name(raw: str) -> str:
     return final
 
 
+def score_movie(query: str, movie_name: str) -> float:
+    if query in movie_name:
+        return 100.0
+
+    partial = fuzz.partial_ratio(query, movie_name)
+    token = fuzz.token_set_ratio(query, movie_name)
+    ratio = fuzz.ratio(query, movie_name)
+    return max(partial, token, ratio)
+
+
 async def save_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
     try:
@@ -106,6 +128,8 @@ async def save_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             {"$setOnInsert": {"name": name.lower(), "msg_id": msg.message_id}},
             upsert=True,
         )
+        if not any(item["msg_id"] == msg.message_id for item in movie_cache):
+            movie_cache.append({"name": name.lower(), "msg_id": msg.message_id})
         logger.info("Saved movie: %s", name)
     except Exception:
         logger.exception("Save error")
@@ -115,7 +139,7 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     del context
     try:
         if collection is None:
-            await update.message.reply_text("Database not connected.")
+            await update.message.reply_text("⚠️ Database not connected.")
             return
 
         if not update.message or not update.message.text:
@@ -126,24 +150,20 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         results = []
-        for item in collection.find({}, {"name": 1, "msg_id": 1, "_id": 0}):
-            score = fuzz.partial_ratio(query, item["name"])
-            if query in item["name"] or score > 60:
-                results.append(item)
+        for item in movie_cache:
+            score = score_movie(query, str(item["name"]))
+            if score >= 55:
+                results.append((score, item))
 
         if not results:
-            await update.message.reply_text("No movie found.")
+            await update.message.reply_text("❌ No movie found.\nTry a different spelling.")
             return
 
-        results = sorted(
-            results,
-            key=lambda item: fuzz.partial_ratio(query, item["name"]),
-            reverse=True,
-        )[:5]
+        results = sorted(results, key=lambda item: item[0], reverse=True)[:6]
 
-        text = f"Query: {query}\nResults: {len(results)}\n\nTap below."
+        text = f"🔎 Query: {query}\n🎬 Results: {len(results)}\n\nTap below 👇"
         buttons = []
-        for movie in results:
+        for _, movie in results:
             url = f"https://t.me/{BOT_USERNAME}?start={movie['msg_id']}"
             buttons.append([InlineKeyboardButton(movie["name"].title(), url=url)])
 
@@ -154,17 +174,17 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception:
         logger.exception("Search error")
         if update.message:
-            await update.message.reply_text("An error occurred.")
+            await update.message.reply_text("⚠️ Something went wrong.")
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         if not context.args:
-            await update.message.reply_text("Send a movie name to search.")
+            await update.message.reply_text("🎬 Send a movie name to search.")
             return
 
         if not CHANNEL_ID:
-            await update.message.reply_text("CHANNEL_ID is not configured.")
+            await update.message.reply_text("⚠️ CHANNEL_ID is not configured.")
             return
 
         msg_id = int(context.args[0])
@@ -175,7 +195,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
         warn = await update.message.reply_text(
-            "This file will be deleted after 5 minutes. Forward it to Saved Messages."
+            "⚠️ This file will be deleted after 5 minutes.\nForward it to Saved Messages."
         )
 
         await asyncio.sleep(DELETE_AFTER_SECONDS)
@@ -188,7 +208,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         logger.exception("Start command error")
         if update.message:
-            await update.message.reply_text("Could not send the file.")
+            await update.message.reply_text("❌ Could not send the file.")
 
 
 async def healthcheck(_request: web.Request) -> web.Response:
@@ -244,6 +264,7 @@ async def run_bot() -> None:
 async def main() -> None:
     global collection
     collection = get_collection()
+    load_movie_cache()
     health_runner = await start_health_server()
 
     try:
