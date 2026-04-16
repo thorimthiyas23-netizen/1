@@ -80,13 +80,23 @@ def load_movie_cache() -> None:
 
 def clean_name(raw: str) -> str:
     text = raw.lower()
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"(?:t\.me|telegram\.me|telegram\.dog)/\S+", " ", text)
+    text = re.sub(r"(?:joinchat/|\+)\S+", " ", text)
+    text = re.sub(r"@\w+", " ", text)
     text = re.sub(r"\.(mkv|mp4|avi)$", "", text)
     text = re.sub(r"[._]+", " ", text)
     text = re.sub(
-        r"\b(1080p|720p|480p|hdrip|bluray|x264|x265|webrip|web-dl|tamil|dubbed)\b",
+        r"\b("
+        r"1080p|720p|480p|hdrip|bluray|x264|x265|webrip|web-dl|"
+        r"tamil|dubbed|join|channel|group|movie\s*request|request|"
+        r"admin|owner|official|telegram"
+        r")\b",
         "",
         text,
     )
+    text = re.sub(r"[\[\](){}|]", " ", text)
+    text = re.sub(r"\b\d{5,}\b", " ", text)
 
     year_match = re.search(r"\b((?:19|20)\d{2})\b", text)
     year = year_match.group(1) if year_match else ""
@@ -106,6 +116,15 @@ def clean_name(raw: str) -> str:
     if size:
         final += f" [{size.upper()}]"
     return final
+
+
+def display_caption(movie: Optional[dict[str, str | int]]) -> str:
+    if not movie:
+        return "Movie File"
+
+    title = str(movie["name"]).title()
+    title = re.sub(r"\s+", " ", title).strip()
+    return title or "Movie File"
 
 
 def score_movie(query: str, movie_name: str) -> float:
@@ -255,7 +274,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         msg_id = int(context.args[0])
         movie = get_cached_movie(msg_id)
-        clean_caption = str(movie["name"]).title() if movie else None
+        clean_caption = display_caption(movie)
 
         sent = await context.bot.copy_message(
             chat_id=update.effective_chat.id,
