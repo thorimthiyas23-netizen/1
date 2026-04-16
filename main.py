@@ -126,6 +126,13 @@ def get_public_base_url() -> str:
     return ""
 
 
+def get_cached_movie(msg_id: int) -> Optional[dict[str, str | int]]:
+    for item in movie_cache:
+        if int(item["msg_id"]) == msg_id:
+            return item
+    return None
+
+
 def cleanup_recent_updates() -> None:
     now = time.time()
     expired = [update_id for update_id, ts in recent_update_ids.items() if now - ts > 600]
@@ -174,7 +181,7 @@ async def save_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             {"$setOnInsert": {"name": name.lower(), "msg_id": msg.message_id}},
             upsert=True,
         )
-        if not any(item["msg_id"] == msg.message_id for item in movie_cache):
+        if not any(int(item["msg_id"]) == msg.message_id for item in movie_cache):
             movie_cache.append({"name": name.lower(), "msg_id": msg.message_id})
         logger.info("Saved movie: %s", name)
     except Exception:
@@ -247,10 +254,15 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         msg_id = int(context.args[0])
+        movie = get_cached_movie(msg_id)
+        clean_caption = str(movie["name"]).title() if movie else None
+
         sent = await context.bot.copy_message(
             chat_id=update.effective_chat.id,
             from_chat_id=CHANNEL_ID,
             message_id=msg_id,
+            caption=clean_caption,
+            reply_markup=None,
         )
 
         warn = await update.message.reply_text(
