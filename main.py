@@ -238,10 +238,6 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        if update.effective_chat and update.effective_chat.type == "private":
-            await send_join_channel_message(update)
-            return
-
         if not context.args:
             await update.message.reply_text("🎬 Send a movie name to search.")
             return
