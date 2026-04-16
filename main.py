@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from typing import Optional
 
 from aiohttp import web
@@ -42,6 +43,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 collection: Optional[Collection] = None
 movie_cache: list[dict[str, str | int]] = []
+recent_update_ids: dict[int, float] = {}
 
 
 def get_collection() -> Optional[Collection]:
@@ -123,6 +125,36 @@ def get_public_base_url() -> str:
     return ""
 
 
+def cleanup_recent_updates() -> None:
+    now = time.time()
+    expired = [update_id for update_id, ts in recent_update_ids.items() if now - ts > 600]
+    for update_id in expired:
+        recent_update_ids.pop(update_id, None)
+
+
+async def delete_temporary_messages(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    sent_message_id: int,
+    warn_message_id: int,
+) -> None:
+    await asyncio.sleep(DELETE_AFTER_SECONDS)
+
+    for message_id in (sent_message_id, warn_message_id):
+        try:
+            await context.bot.delete_message(chat_id, message_id)
+        except Exception:
+            logger.warning("Could not delete message %s", message_id)
+
+    try:
+        await context.bot.send_message(
+            chat_id,
+            "🗑️ File deleted after 5 minutes.\n🔒 Request it again if you still need it.",
+        )
+    except Exception:
+        logger.warning("Could not send delete confirmation to chat %s", chat_id)
+
+
 async def save_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
     try:
@@ -178,7 +210,7 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         buttons = []
         for _, movie in results:
             url = f"https://t.me/{BOT_USERNAME}?start={movie['msg_id']}"
-            buttons.append([InlineKeyboardButton(movie["name"].title(), url=url)])
+            buttons.append([InlineKeyboardButton(str(movie["name"]).title(), url=url)])
 
         await update.message.reply_text(
             text,
@@ -211,16 +243,13 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "⚠️ This file will be deleted after 5 minutes.\nForward it to Saved Messages."
         )
 
-        await asyncio.sleep(DELETE_AFTER_SECONDS)
-
-        for message_id in (sent.message_id, warn.message_id):
-            try:
-                await context.bot.delete_message(update.effective_chat.id, message_id)
-            except Exception:
-                logger.warning("Could not delete message %s", message_id)
-
-        await update.effective_chat.send_message(
-            "🗑️ File deleted after 5 minutes.\n🔒 Request it again if you still need it."
+        context.application.create_task(
+            delete_temporary_messages(
+                context,
+                update.effective_chat.id,
+                sent.message_id,
+                warn.message_id,
+            )
         )
     except Exception:
         logger.exception("Start command error")
@@ -242,7 +271,13 @@ async def telegram_webhook(request: web.Request) -> web.Response:
 
     data = await request.json()
     update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.process_update(update)
+
+    cleanup_recent_updates()
+    if update.update_id in recent_update_ids:
+        return web.Response(status=200, text="duplicate")
+
+    recent_update_ids[update.update_id] = time.time()
+    telegram_app.create_task(telegram_app.process_update(update))
     return web.Response(status=200, text="ok")
 
 
